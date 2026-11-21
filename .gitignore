@@ -1,0 +1,12 @@
+# Local environment variables — never commit this
+.env
+
+# Lambda build artefacts
+package/
+function.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

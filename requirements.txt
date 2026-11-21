@@ -1,0 +1,2 @@
+strands-agents>=0.1.0
+aws-lambda-powertools==3.25.0
