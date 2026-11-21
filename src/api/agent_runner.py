@@ -384,6 +384,18 @@ def run_chat(garden_id: str, message: str) -> str:
         try:
             garden_data.put_chat_session(garden_id, agent.messages)
         except Exception as save_exc:  # noqa: BLE001
+            error_str = str(save_exc).lower()
+            if "item size" in error_str or "exceeded the maximum" in error_str:
+                logger.warning(
+                    "Chat session too large to save for garden_id=%s — history not persisted",
+                    garden_id,
+                )
+                return (
+                    reply
+                    + "\n\n⚠️ Your conversation history has grown too long to save. "
+                    "Please reset the conversation and start fresh:\n"
+                    "  DELETE /api/v1/agent/chat"
+                )
             logger.error(
                 "Failed to save chat session for garden_id=%s: %s", garden_id, save_exc
             )
