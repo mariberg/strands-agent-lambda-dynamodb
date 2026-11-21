@@ -1,348 +1,350 @@
 """
-Guardrail tests for the garden-action tool.
+Guardrail tests for the deployed agent tools in src/api/agent_runner.py.
 
-Five areas covered (in order):
+The Lambda runs src.api.router.lambda_handler, which calls run_chat and
+run_session_open in agent_runner.py. These tests import that module directly,
+so a regression in the code that actually runs will fail here.
 
-1. SCHEMA SHAPE
-   The tool schema contains no user_id or garden_id field.  Any future
-   addition of those parameters will break these tests immediately.
+The design being locked in: the model never chooses which garden it acts on.
+run_chat / run_session_open bind the garden to a ContextVar before the agent
+starts, and every garden-scoped tool reads it from there. No tool takes a
+garden_id or user_id parameter, so the model has no field to put one in.
 
-2. PLANT OWNERSHIP
-   A write to a plant that doesn't exist in the user's garden, or belongs
-   to a different user, is rejected.
+Areas covered:
+1. Tool schemas      - no garden_id/user_id on any tool; params are pinned.
+2. Context binding   - the runners bind the garden and register only scoped tools.
+3. No context        - every tool refuses to touch the DB without a bound garden.
+4. Plant ownership   - writes to plants outside the bound garden are rejected.
+5. Scoped reads      - reads only ever query the bound garden.
+6. Input validation  - bad action types and species are rejected before writing.
+7. Shared rules      - the agent tool and REST endpoint accept the same action types.
+8. ID injection      - a model-supplied garden_id/user_id is rejected outright.
 
-3. INPUT VALIDATION
-   Invalid action_type values and malformed dates are rejected before
-   anything reaches the database.
-
-4. SHARED VALIDATION PATH
-   Both the agent-tool path and the REST endpoint call the same validation
-   functions — validate_garden_action and validate_user_id — so tightening
-   a rule in one place automatically tightens it everywhere.
-
-5. ID INJECTION PREVENTION
-   An attempt to pass user_id or garden_id in the tool input — simulating
-   a mocked model response that tries to smuggle extra fields — is rejected
-   by Python's own call convention.
+Dates: the agent tools don't take a date (create_action_log stamps the current
+time), so there is no date input on the agent path to validate.
 """
 
 import inspect
-import json
 from unittest.mock import patch
 
 import pytest
 
-# conftest.py handles strands/boto3 stubs and sys.path before this is imported.
-from agent import lambda_handler, validate_user_id
-from garden_tool import (
-    VALID_ACTION_TYPES,
-    clear_authorized_plants,
-    record_garden_action,
-    set_authorized_plants,
-    validate_garden_action,
-)
+# conftest.py stubs strands/boto3 and sets sys.path before this import.
+from src.api import agent_runner as ar
+from src.api.enums import ActionType, validate_enum
+from src.api.errors import ApiError
+
+AUTHORIZED_GARDEN = "demo-garden-1"
+OTHER_GARDEN = "demo-garden-4"
+
+# Plants that exist in the fake table, keyed by (garden_id, instance_id).
+# orchid-07 is real, but it belongs to someone else's garden.
+FAKE_PLANTS = {
+    (AUTHORIZED_GARDEN, "rose-01"): {"instance_id": "rose-01", "nickname": "Big Rose"},
+    (OTHER_GARDEN, "orchid-07"): {"instance_id": "orchid-07", "nickname": "Not Yours"},
+}
+
+# Every tool that reads or writes garden data. Each must get its garden from
+# the authorized context, never from a parameter.
+GARDEN_TOOLS = [
+    ar.get_garden_plants,
+    ar.get_recent_plant_logs,
+    ar.save_dashboard_summary,
+    ar.create_action_log,
+    ar.add_plant,
+]
+
+# The full parameter list of each tool is pinned. Adding any parameter fails a
+# test, so a garden_id can't be slipped back in without someone noticing.
+EXPECTED_PARAMS = {
+    "get_garden_plants": set(),
+    "get_recent_plant_logs": {"instance_id"},
+    "save_dashboard_summary": {"summary_text", "plant_highlights"},
+    "create_action_log": {"instance_id", "action_type", "notes", "title", "severity"},
+    "add_plant": {"species_id", "nickname", "emoji", "garden_location"},
+}
+
+# Names that would let the model choose or widen whose data it touches.
+FORBIDDEN_PARAMS = {"garden_id", "user_id", "owner_id", "authorized_garden", "override"}
+
+# Valid arguments for each tool, used to show the only thing wrong in the
+# injection tests is the extra ID.
+VALID_ARGS = {
+    "get_garden_plants": {},
+    "get_recent_plant_logs": {"instance_id": "rose-01"},
+    "save_dashboard_summary": {"summary_text": "All good.", "plant_highlights": {}},
+    "create_action_log": {"instance_id": "rose-01", "action_type": "watered"},
+    "add_plant": {"species_id": "rosa", "nickname": "Rose"},
+}
 
 
 # ---------------------------------------------------------------------------
-# Helpers shared across test classes
+# Fixtures
 # ---------------------------------------------------------------------------
 
-def lambda_url_event(body: dict) -> dict:
-    """Minimal Lambda URL (HTTP) event."""
-    return {
-        "requestContext": {"http": {"method": "POST"}},
-        "body": json.dumps(body),
-    }
+@pytest.fixture(autouse=True)
+def authorized_garden():
+    """Bind AUTHORIZED_GARDEN for each test, then restore the previous value."""
+    token = ar._authorized_garden_id.set(AUTHORIZED_GARDEN)
+    yield
+    ar._authorized_garden_id.reset(token)
 
 
-def direct_event(user_id) -> dict:
-    """Minimal direct-invoke Lambda event."""
-    return {"user_id": user_id}
+@pytest.fixture
+def no_garden_context():
+    """Simulate a runner that forgot to call set_authorized_garden."""
+    token = ar._authorized_garden_id.set(None)
+    yield
+    ar._authorized_garden_id.reset(token)
+
+
+@pytest.fixture
+def dal():
+    """Replace every DAL call the tools make with a mock. Nothing touches AWS."""
+    with patch.object(ar.garden_data, "get_plant",
+                      side_effect=lambda g, i: FAKE_PLANTS.get((g, i))) as get_plant, \
+         patch.object(ar.garden_data, "put_plant") as put_plant, \
+         patch.object(ar.garden_data, "put_log") as put_log, \
+         patch.object(ar.garden_data, "list_plants", return_value=[]) as list_plants, \
+         patch.object(ar.garden_data, "list_logs_for_plant", return_value=[]) as list_logs, \
+         patch.object(ar.garden_data, "put_dashboard_summary") as put_dashboard, \
+         patch.object(ar.species_dal, "get_species",
+                      side_effect=lambda s: {"common_name": "Rose"} if s == "rosa" else None) as get_species:
+        yield {
+            "get_plant": get_plant,
+            "put_plant": put_plant,
+            "put_log": put_log,
+            "list_plants": list_plants,
+            "list_logs_for_plant": list_logs,
+            "put_dashboard_summary": put_dashboard,
+            "get_species": get_species,
+        }
+
+
+def assert_nothing_written(dal):
+    dal["put_plant"].assert_not_called()
+    dal["put_log"].assert_not_called()
+    dal["put_dashboard_summary"].assert_not_called()
+
+
+def is_error(result) -> bool:
+    """Tools return either an 'Error...' string or a list with an error dict."""
+    if isinstance(result, str):
+        return result.startswith("Error") or result.startswith("Invalid")
+    if isinstance(result, list):
+        return bool(result) and "error" in result[0]
+    return False
 
 
 # ---------------------------------------------------------------------------
-# 1. Tool schema shape — no user_id or garden_id
+# 1. Tool schemas
 # ---------------------------------------------------------------------------
 
-class TestToolSchema:
-    """
-    The @tool decorator generates a JSON schema from the Python function
-    signature.  If user_id or garden_id ever appear in the parameters, the
-    LLM can supply them directly, bypassing the authorization layer.
+class TestToolSchemas:
+    """The tool signature is the schema the model sees. Lock it down."""
 
-    These tests fail the moment someone adds a forbidden parameter.
-    """
-
-    def _params(self) -> set:
-        return set(inspect.signature(record_garden_action).parameters)
-
-    def test_no_user_id_in_schema(self):
-        assert "user_id" not in self._params(), (
-            "user_id MUST NOT be in the tool schema; ownership is resolved "
-            "from the authorization context set by lambda_handler, not from "
-            "LLM-supplied input."
+    @pytest.mark.parametrize("tool", GARDEN_TOOLS, ids=lambda t: t.__name__)
+    def test_no_forbidden_params(self, tool):
+        params = set(inspect.signature(tool).parameters)
+        assert not params & FORBIDDEN_PARAMS, (
+            f"{tool.__name__} exposes {params & FORBIDDEN_PARAMS} to the model. "
+            "The garden must come from the authorized context, not a parameter."
         )
 
-    def test_no_garden_id_in_schema(self):
-        assert "garden_id" not in self._params(), (
-            "garden_id MUST NOT be in the tool schema."
-        )
-
-    def test_expected_params_are_present(self):
-        """Guard against accidental removal of required parameters."""
-        params = self._params()
-        assert "action_type" in params
-        assert "plant_id" in params
-        assert "date" in params
-
-    def test_only_known_params_are_present(self):
-        """Enumerate all allowed parameters so new additions are flagged."""
-        allowed = {"action_type", "plant_id", "date", "notes"}
-        unexpected = self._params() - allowed
-        assert not unexpected, (
-            f"Unexpected parameter(s) in tool schema: {unexpected}.  "
-            "If this is intentional, add the name to 'allowed' in this test."
+    @pytest.mark.parametrize("tool", GARDEN_TOOLS, ids=lambda t: t.__name__)
+    def test_params_are_exactly_as_expected(self, tool):
+        params = set(inspect.signature(tool).parameters)
+        assert params == EXPECTED_PARAMS[tool.__name__], (
+            f"{tool.__name__} params changed to {params}. If this is intentional "
+            "and safe, update EXPECTED_PARAMS in this test."
         )
 
 
 # ---------------------------------------------------------------------------
-# 2. Plant ownership authorization
+# 2. Context binding in the runners
+# ---------------------------------------------------------------------------
+
+class TestRunnersBindGarden:
+    """The runners must bind the garden before the agent runs."""
+
+    def _capture_garden_during_agent_call(self, run):
+        """Run `run()` with a fake Agent that records the bound garden when invoked."""
+        seen = {}
+
+        def fake_agent_call(*_args, **_kwargs):
+            seen["garden"] = ar._current_garden_id()
+            return "ok"
+
+        with patch.object(ar, "Agent") as MockAgent, \
+             patch.object(ar.garden_data, "get_garden_metadata", return_value={"city": "Test"}), \
+             patch.object(ar.garden_data, "get_chat_session", return_value=[]), \
+             patch.object(ar.garden_data, "put_chat_session"):
+            MockAgent.return_value.side_effect = fake_agent_call
+            run()
+            return seen.get("garden"), MockAgent.call_args.kwargs["tools"]
+
+    def test_run_chat_binds_the_requested_garden(self):
+        ar._authorized_garden_id.set(None)
+        garden, _ = self._capture_garden_during_agent_call(
+            lambda: ar.run_chat("demo-garden-9", "hello")
+        )
+        assert garden == "demo-garden-9"
+
+    def test_run_session_open_binds_the_requested_garden(self):
+        ar._authorized_garden_id.set(None)
+        garden, _ = self._capture_garden_during_agent_call(
+            lambda: ar.run_session_open("demo-garden-9")
+        )
+        assert garden == "demo-garden-9"
+
+    def test_chat_agent_registers_only_known_tools(self):
+        """Adding a tool to the chat agent must be a deliberate, reviewed change."""
+        _, tools = self._capture_garden_during_agent_call(
+            lambda: ar.run_chat(AUTHORIZED_GARDEN, "hello")
+        )
+        assert tools == [
+            ar.http_request,
+            ar.get_garden_plants,
+            ar.get_plant_species,
+            ar.get_recent_plant_logs,
+            ar.add_plant,
+            ar.create_action_log,
+        ]
+
+
+# ---------------------------------------------------------------------------
+# 3. No authorized context
+# ---------------------------------------------------------------------------
+
+class TestNoContextRefuses:
+    """If a runner forgets to bind a garden, every tool refuses and nothing is written."""
+
+    @pytest.mark.parametrize("tool", GARDEN_TOOLS, ids=lambda t: t.__name__)
+    def test_tool_refuses_without_context(self, tool, dal, no_garden_context):
+        result = tool(**VALID_ARGS[tool.__name__])
+        assert is_error(result), f"{tool.__name__} ran without a bound garden: {result!r}"
+        assert_nothing_written(dal)
+        dal["list_plants"].assert_not_called()
+        dal["list_logs_for_plant"].assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 4. Plant ownership on writes
 # ---------------------------------------------------------------------------
 
 class TestPlantOwnership:
-    """
-    Writes must be rejected when the plant_id is not in the authenticated
-    user's garden — whether it truly doesn't exist or belongs to someone else.
-    """
 
-    def setup_method(self):
-        clear_authorized_plants()
+    def test_log_for_owned_plant_is_written_to_bound_garden(self, dal):
+        result = ar.create_action_log("rose-01", "watered")
+        assert not is_error(result), result
+        assert dal["put_log"].call_args.kwargs["garden_id"] == AUTHORIZED_GARDEN
 
-    def teardown_method(self):
-        clear_authorized_plants()
+    def test_log_for_nonexistent_plant_is_rejected(self, dal):
+        result = ar.create_action_log("lemon-tree-99", "watered")
+        assert is_error(result)
+        assert_nothing_written(dal)
 
-    def test_write_to_owned_plant_succeeds(self):
-        set_authorized_plants(frozenset({"rose_1", "sunflower_2"}))
-        result = record_garden_action("watered", "rose_1", "2024-06-01")
-        assert result.get("status") == "recorded"
-        assert "error" not in result
+    def test_log_for_another_gardens_plant_is_rejected(self, dal):
+        """orchid-07 exists, but only in OTHER_GARDEN. The lookup must use the bound garden."""
+        result = ar.create_action_log("orchid-07", "watered")
+        assert is_error(result)
+        assert_nothing_written(dal)
+        dal["get_plant"].assert_called_once_with(AUTHORIZED_GARDEN, "orchid-07")
 
-    def test_write_to_nonexistent_plant_rejected(self):
-        set_authorized_plants(frozenset({"rose_1"}))
-        result = record_garden_action("watered", "cactus_99", "2024-06-01")
-        assert "error" in result
-
-    def test_error_does_not_leak_other_plant_ids(self):
-        """The error message must not reveal what plants the user does own."""
-        set_authorized_plants(frozenset({"rose_1"}))
-        result = record_garden_action("watered", "cactus_99", "2024-06-01")
-        assert "rose_1" not in result.get("error", "")
-
-    def test_write_to_another_users_plant_rejected(self):
-        """User A's context must not allow writing to User B's plant."""
-        set_authorized_plants(frozenset({"rose_1"}))          # user A
-        result = record_garden_action("watered", "orchid_7", "2024-06-01")
-        assert "error" in result
-
-    def test_no_authorization_context_always_rejected(self):
-        """
-        If lambda_handler forgot to call set_authorized_plants, every write
-        must be refused — including writes to real plant IDs.
-        """
-        # clear_authorized_plants called in setup_method; no set call here
-        result = record_garden_action("watered", "rose_1", "2024-06-01")
-        assert "error" in result
-        assert "authorization" in result["error"].lower()
+    def test_add_plant_writes_to_bound_garden(self, dal):
+        result = ar.add_plant("rosa", "Rose")
+        assert not is_error(result), result
+        assert dal["put_plant"].call_args.args[0] == AUTHORIZED_GARDEN
 
 
 # ---------------------------------------------------------------------------
-# 3. Input validation — action types and dates
+# 5. Reads are scoped too
 # ---------------------------------------------------------------------------
 
-class TestActionTypeValidation:
+class TestScopedReads:
+    """Reads leak data just as surely as writes corrupt it."""
 
-    def test_all_valid_action_types_accepted(self):
-        for action in VALID_ACTION_TYPES:
-            is_valid, msg = validate_garden_action(action, "rose_1", "2024-06-01")
-            assert is_valid, f"Expected '{action}' to be valid, got: {msg}"
+    def test_get_garden_plants_reads_bound_garden(self, dal):
+        ar.get_garden_plants()
+        dal["list_plants"].assert_called_once_with(AUTHORIZED_GARDEN)
 
-    def test_unknown_action_type_rejected(self):
-        is_valid, msg = validate_garden_action("sprayed", "rose_1", "2024-06-01")
-        assert not is_valid
-        assert "action_type" in msg
+    def test_get_recent_plant_logs_reads_bound_garden(self, dal):
+        ar.get_recent_plant_logs("orchid-07")
+        dal["list_logs_for_plant"].assert_called_once_with(AUTHORIZED_GARDEN, "orchid-07")
 
-    def test_empty_action_type_rejected(self):
-        is_valid, _ = validate_garden_action("", "rose_1", "2024-06-01")
-        assert not is_valid
-
-    def test_action_type_with_injection_attempt_rejected(self):
-        """SQL / shell injection in action_type must not reach the database."""
-        is_valid, _ = validate_garden_action(
-            "watered; DROP TABLE actions;", "rose_1", "2024-06-01"
-        )
-        assert not is_valid
-
-
-class TestDateValidation:
-
-    def test_valid_iso_date_accepted(self):
-        is_valid, _ = validate_garden_action("watered", "rose_1", "2024-06-15")
-        assert is_valid
-
-    def test_datetime_string_rejected(self):
-        """A datetime with a time component must not be accepted as a date."""
-        is_valid, msg = validate_garden_action("watered", "rose_1", "2024-06-15T12:00:00")
-        assert not is_valid
-        assert "date" in msg.lower()
-
-    def test_dd_mm_yyyy_format_rejected(self):
-        """European date format must not silently parse as a different date."""
-        is_valid, _ = validate_garden_action("watered", "rose_1", "15-06-2024")
-        assert not is_valid
-
-    def test_nonsense_string_rejected(self):
-        is_valid, _ = validate_garden_action("watered", "rose_1", "not-a-date")
-        assert not is_valid
-
-    def test_month_out_of_range_rejected(self):
-        is_valid, _ = validate_garden_action("watered", "rose_1", "2024-13-01")
-        assert not is_valid
-
-    def test_empty_date_rejected(self):
-        is_valid, _ = validate_garden_action("watered", "rose_1", "")
-        assert not is_valid
+    def test_save_dashboard_summary_writes_bound_garden(self, dal):
+        ar.save_dashboard_summary("All good.", {})
+        assert dal["put_dashboard_summary"].call_args.args[0] == AUTHORIZED_GARDEN
 
 
 # ---------------------------------------------------------------------------
-# 4. Shared validation path
+# 6. Input validation
 # ---------------------------------------------------------------------------
 
-class TestSharedValidationPath:
+class TestInputValidation:
+
+    @pytest.mark.parametrize("bad_type", ["sprayed", "", "WATERED", "watered; DROP TABLE logs"])
+    def test_invalid_action_type_rejected(self, dal, bad_type):
+        result = ar.create_action_log("rose-01", bad_type)
+        assert is_error(result)
+        assert_nothing_written(dal)
+
+    def test_invalid_severity_is_dropped_not_stored(self, dal):
+        ar.create_action_log("rose-01", "issue_found", severity="catastrophic")
+        assert "severity" not in dal["put_log"].call_args.kwargs["item"]
+
+    def test_unknown_species_rejected(self, dal):
+        result = ar.add_plant("not-a-real-species", "Mystery")
+        assert is_error(result)
+        assert_nothing_written(dal)
+
+    @pytest.mark.parametrize("species_id, nickname", [("", "Rose"), ("rosa", "")])
+    def test_missing_required_field_rejected(self, dal, species_id, nickname):
+        result = ar.add_plant(species_id, nickname)
+        assert is_error(result)
+        assert_nothing_written(dal)
+
+
+# ---------------------------------------------------------------------------
+# 7. Agent tool and REST endpoint agree on the rules
+# ---------------------------------------------------------------------------
+
+class TestAgentAndRestAgree:
     """
-    Both the agent-tool path and the REST endpoint must route through the
-    same validation functions so that tightening one rule tightens both.
+    POST /plants/{id}/action-logs validates action_type with validate_enum and
+    the ActionType enum. create_action_log keeps its own copy of the list.
+    These tests catch the two drifting apart. A single shared validation
+    function would remove the duplication, and this test would then pin it.
     """
 
-    # --- validate_user_id is called by both lambda_handler entry points ---
+    @pytest.mark.parametrize("action_type", [a.value for a in ActionType])
+    def test_every_rest_action_type_accepted_by_tool(self, dal, action_type):
+        assert not is_error(ar.create_action_log("rose-01", action_type))
 
-    def test_rest_path_calls_validate_user_id(self):
-        """Lambda URL handler must delegate user_id checking to validate_user_id."""
-        with patch("agent.validate_user_id", wraps=validate_user_id) as mock_validate:
-            with patch("agent.Agent") as MockAgent:
-                MockAgent.return_value.return_value = {"summary": "ok", "details": {}}
-                lambda_handler(lambda_url_event({"user_id": "user_42"}), None)
-            mock_validate.assert_called_once_with("user_42")
-
-    def test_direct_path_calls_validate_user_id(self):
-        """Direct Lambda invocation must also delegate to validate_user_id."""
-        with patch("agent.validate_user_id", wraps=validate_user_id) as mock_validate:
-            with patch("agent.Agent") as MockAgent:
-                MockAgent.return_value.return_value = {"summary": "ok", "details": {}}
-                lambda_handler(direct_event("user_42"), None)
-            mock_validate.assert_called_once_with("user_42")
-
-    def test_same_invalid_user_id_rejected_on_both_paths(self):
-        """
-        An input that validate_user_id rejects must be rejected identically
-        by both entry points — there must be no second path that skips validation.
-        """
-        bad_id = "bad id!"
-
-        rest_response = lambda_handler(lambda_url_event({"user_id": bad_id}), None)
-        direct_response = lambda_handler(direct_event(bad_id), None)
-
-        # REST path returns a 400 HTTP response
-        assert rest_response["statusCode"] == 400
-        rest_body = json.loads(rest_response["body"])
-        assert "invalid characters" in rest_body["message"].lower()
-
-        # Direct path returns an error in the summary field
-        assert "Error:" in direct_response.get("summary", "")
-        assert "invalid characters" in direct_response["summary"].lower()
-
-    # --- validate_garden_action is called by the tool, not duplicated ---
-
-    def test_tool_delegates_to_validate_garden_action(self):
-        """
-        record_garden_action must call validate_garden_action rather than
-        duplicating the logic inline.  If someone adds a new validation rule
-        to validate_garden_action, the tool picks it up automatically.
-        """
-        with patch(
-            "garden_tool.validate_garden_action", wraps=validate_garden_action
-        ) as mock_validate:
-            clear_authorized_plants()
-            set_authorized_plants(frozenset({"rose_1"}))
-            record_garden_action("watered", "rose_1", "2024-06-01")
-            mock_validate.assert_called_once_with("watered", "rose_1", "2024-06-01")
-
-    def test_validation_error_surfaces_through_tool(self):
-        """
-        An input that validate_garden_action rejects must produce an error
-        response from the tool — not a silent pass-through.
-        """
-        clear_authorized_plants()
-        set_authorized_plants(frozenset({"rose_1"}))
-        result = record_garden_action("watered", "rose_1", "not-a-date")
-        assert "error" in result
-        assert "date" in result["error"].lower()
+    @pytest.mark.parametrize("bad_type", ["sprayed", "fertilized", "harvested"])
+    def test_types_rest_rejects_are_rejected_by_tool(self, dal, bad_type):
+        with pytest.raises(ApiError):
+            validate_enum("action_type", bad_type, ActionType)
+        assert is_error(ar.create_action_log("rose-01", bad_type))
 
 
 # ---------------------------------------------------------------------------
-# 5. ID injection prevention
+# 8. ID injection
 # ---------------------------------------------------------------------------
 
-class TestIdInjectionPrevention:
+class TestIdInjection:
     """
-    These tests simulate a model that attempts to smuggle user_id or
-    garden_id into a tool call.  Python's own call convention is the first
-    line of defence: extra keyword arguments raise TypeError for functions
-    whose signatures don't include them.
-
-    With @tool as a pass-through, record_garden_action IS the real function,
-    so its signature is fully enforced at call time.
+    Simulates a model response that adds an ID the schema doesn't offer, e.g.
+    {"name": "add_plant", "input": {"species_id": "rosa", ..., "garden_id": "demo-garden-4"}}.
+    The call must fail outright rather than silently pick a garden.
     """
 
-    def test_injecting_user_id_as_kwarg_raises_type_error(self):
+    @pytest.mark.parametrize("tool", GARDEN_TOOLS, ids=lambda t: t.__name__)
+    @pytest.mark.parametrize("injected", [
+        {"garden_id": OTHER_GARDEN},
+        {"user_id": "demo-user-4"},
+    ], ids=["garden_id", "user_id"])
+    def test_injected_id_is_rejected(self, tool, injected, dal):
         with pytest.raises(TypeError, match="unexpected keyword argument"):
-            record_garden_action(
-                action_type="watered",
-                plant_id="rose_1",
-                date="2024-06-01",
-                user_id="attacker_id",          # LLM-injected field
-            )
-
-    def test_injecting_garden_id_as_kwarg_raises_type_error(self):
-        with pytest.raises(TypeError, match="unexpected keyword argument"):
-            record_garden_action(
-                action_type="watered",
-                plant_id="rose_1",
-                date="2024-06-01",
-                garden_id="someone_elses_garden",  # LLM-injected field
-            )
-
-    def test_valid_plant_id_format_still_requires_ownership(self):
-        """
-        Even a correctly formatted plant_id that exists somewhere in the
-        system must be rejected if it is not in the current user's garden.
-        """
-        clear_authorized_plants()
-        set_authorized_plants(frozenset({"rose_1"}))
-        result = record_garden_action("watered", "orchid_7", "2024-06-01")
-        assert "error" in result
-
-    def test_tool_has_no_parameter_that_expands_authorization(self):
-        """
-        Enumerate suspicious parameter names.  Any of these would give the
-        model a mechanism to widen its own permissions.
-        """
-        params = set(inspect.signature(record_garden_action).parameters)
-        forbidden = {
-            "user_id", "garden_id", "authorized_plants",
-            "owner", "owner_id", "override",
-        }
-        intruders = params & forbidden
-        assert not intruders, (
-            f"Parameter(s) {intruders} found in tool signature — the model "
-            "could use these to override authorization."
-        )
+            tool(**VALID_ARGS[tool.__name__], **injected)
+        assert_nothing_written(dal)

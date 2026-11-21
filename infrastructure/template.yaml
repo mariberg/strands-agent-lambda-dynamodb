@@ -111,6 +111,7 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 300
       MemorySize: 256
+      ReservedConcurrentExecutions: 5  # cost ceiling — prevents runaway invocations on the public URL
       Code:
         !If
           - HasS3Code

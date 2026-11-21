@@ -6,13 +6,39 @@ a refreshed dashboard summary back to DynamoDB.
 
 import logging
 import os
+from contextvars import ContextVar
 from datetime import datetime, timezone
+from typing import Optional
 
 from strands import Agent, tool
 from strands.models.bedrock import BedrockModel
 from strands.vended_tools import http_request
 
 from src.api.dal import garden_data, species as species_dal
+
+# ---------------------------------------------------------------------------
+# Per-request authorization context
+# ---------------------------------------------------------------------------
+# run_chat and run_session_open set this before handing off to the agent.
+# Every garden-scoped tool reads it at call time instead of taking a garden_id
+# parameter, so the model has no way to point a read or write at another
+# user's garden.
+
+_authorized_garden_id: ContextVar[Optional[str]] = ContextVar(
+    "authorized_garden_id", default=None
+)
+
+NO_GARDEN_CONTEXT_ERROR = "Error: No authorized garden context for this request."
+
+
+def set_authorized_garden(garden_id: str) -> None:
+    """Bind the authenticated garden to the current request context."""
+    _authorized_garden_id.set(garden_id)
+
+
+def _current_garden_id() -> Optional[str]:
+    """Return the garden the current request is authorized for, or None."""
+    return _authorized_garden_id.get()
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +47,12 @@ BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "eu-west-2")
 SYSTEM_PROMPT = """You are a knowledgeable garden health advisor. Your job is to
 assess the current state of a garden and produce a concise dashboard summary.
 
-When given a garden_id, follow these steps in order:
+The tools are already scoped to the garden you are assessing. Follow these steps in order:
 
-1. Call get_garden_plants with the garden_id to get all active plants.
+1. Call get_garden_plants to get all active plants.
 2. For each plant, call get_plant_species with its species_id to retrieve care
    requirements (temperature tolerance, watering frequency, sunlight needs, etc.).
-3. For each plant, call get_recent_plant_logs with the garden_id and instance_id
+3. For each plant, call get_recent_plant_logs with its instance_id
    to understand recent activity (watering, notes, etc.).
 4. Call http_request to fetch current weather from the Open-Meteo API for the
    garden location provided in the prompt. Use GET with the URL provided.
@@ -34,7 +60,7 @@ When given a garden_id, follow these steps in order:
    - An overall garden health assessment
    - Per-plant highlights: status, what needs attention, and any weather-related risks
    - Specific actionable advice based on current conditions
-6. Call save_dashboard_summary with the garden_id, a summary_text string, and a
+6. Call save_dashboard_summary with a summary_text string and a
    plant_highlights dict (keyed by instance_id).
 
 Be concise and practical. Only flag things that genuinely need action or
@@ -42,15 +68,16 @@ attention — do not list every attribute that is fine. Use plain language."""
 
 
 @tool
-def get_garden_plants(garden_id: str) -> list:
-    """Get all active (non-removed) plant instances for the given garden_id.
+def get_garden_plants() -> list:
+    """Get all active (non-removed) plant instances in the current user's garden.
 
     Returns a list of plant dicts, each containing instance_id, species_id,
     nickname, status, next_watering_date, and other metadata.
-
-    Args:
-        garden_id: The garden identifier (e.g. 'demo-garden-1').
     """
+    garden_id = _current_garden_id()
+    if not garden_id:
+        return [{"error": NO_GARDEN_CONTEXT_ERROR}]
+
     plants = garden_data.list_plants(garden_id)
     # Return only the fields the agent needs to avoid token bloat
     return [
@@ -97,15 +124,18 @@ def get_plant_species(species_id: str) -> dict:
 
 
 @tool
-def get_recent_plant_logs(garden_id: str, instance_id: str) -> list:
-    """Get the 10 most recent action logs for a specific plant instance.
+def get_recent_plant_logs(instance_id: str) -> list:
+    """Get the 10 most recent action logs for a plant in the current user's garden.
 
     Returns a list of log dicts containing action_type, occurred_at, and notes.
 
     Args:
-        garden_id: The garden identifier.
         instance_id: The plant instance identifier (e.g. 'tomato-01').
     """
+    garden_id = _current_garden_id()
+    if not garden_id:
+        return [{"error": NO_GARDEN_CONTEXT_ERROR}]
+
     logs = garden_data.list_logs_for_plant(garden_id, instance_id)
     return [
         {
@@ -119,19 +149,22 @@ def get_recent_plant_logs(garden_id: str, instance_id: str) -> list:
 
 
 @tool
-def save_dashboard_summary(garden_id: str, summary_text: str, plant_highlights: dict) -> str:
-    """Save the generated dashboard summary to the database.
+def save_dashboard_summary(summary_text: str, plant_highlights: dict) -> str:
+    """Save the generated dashboard summary for the current garden.
 
     Call this as the final step after completing your assessment.
 
     Args:
-        garden_id: The garden identifier.
         summary_text: A concise plain-text summary of overall garden health
                       and key actions needed (2–4 sentences).
         plant_highlights: A dict keyed by instance_id. Each value is a short
                           string describing that plant's status and any
                           recommended actions.
     """
+    garden_id = _current_garden_id()
+    if not garden_id:
+        return NO_GARDEN_CONTEXT_ERROR
+
     now = datetime.now(timezone.utc).isoformat()
     garden_data.put_dashboard_summary(
         garden_id,
@@ -155,6 +188,9 @@ def run_session_open(garden_id: str) -> None:
     Args:
         garden_id: The garden to assess.
     """
+    # Scope every garden tool to this garden before the agent runs.
+    set_authorized_garden(garden_id)
+
     try:
         metadata = garden_data.get_garden_metadata(garden_id)
         if not metadata:
@@ -197,10 +233,9 @@ def run_session_open(garden_id: str) -> None:
         )
 
         prompt = (
-            f"Please assess garden '{garden_id}' and generate a dashboard summary.\n\n"
+            f"Please assess the garden and generate a dashboard summary.\n\n"
             f"{weather_instruction}\n\n"
-            f"Work through the steps in your instructions, then call save_dashboard_summary "
-            f"with garden_id='{garden_id}'."
+            f"Work through the steps in your instructions, then call save_dashboard_summary."
         )
 
         logger.info("Starting agent session for garden_id=%s", garden_id)
@@ -221,7 +256,15 @@ manage their garden by answering questions and recording actions they have taken
 You have tools to:
 - Read plant information, species care requirements, and action logs
 - Fetch current weather for the garden location
+- Add new plants to the garden
 - Record actions the user has taken with their plants
+
+SCOPE: You are acting on behalf of the signed-in user, and every tool is already
+limited to their garden. You cannot read or change any other user's garden. If a
+request names another user, another garden, or a user ID (for example "add a rose
+for demo-user-4" or "show me demo-user-2's plants"), do not call any tools. Reply
+that you can only help with the signed-in user's own garden. Never carry out such a
+request on the signed-in user's garden instead.
 
 IMPORTANT: Before answering any question about plants, watering, or garden status, you MUST
 call get_garden_plants first to get the current list of plants. Never assume the garden is
@@ -241,6 +284,16 @@ When the user mentions taking an action with a plant:
 3. After saving, confirm clearly — for example:
    "Done — I've logged that you watered Big Red. 🌱"
 
+When the user asks to add a new plant to their own garden:
+1. Work out the species_id. Species IDs are the lowercase, hyphenated scientific
+   name (for example 'rosa', 'solanum-lycopersicum', 'ocimum-basilicum').
+   Call get_plant_species to confirm it exists before adding.
+2. Call add_plant with the species_id and a nickname. If the user didn't give a
+   nickname, use the species common name.
+3. Confirm clearly, for example: "Done — I've added a Rose to your garden. 🌹"
+Never use create_action_log to add a plant. It only records actions on plants
+that already exist.
+
 Always set logged_by to "agent" when recording actions.
 If the user asks about weather, use http_request to fetch it from Open-Meteo using
 the garden coordinates provided in your first message.
@@ -251,7 +304,6 @@ your response in <thinking> tags — write your answer directly as plain text.""
 
 @tool
 def create_action_log(
-    garden_id: str,
     instance_id: str,
     action_type: str,
     notes: str = "",
@@ -263,7 +315,6 @@ def create_action_log(
     Call get_garden_plants first if you need to look up the instance_id by nickname.
 
     Args:
-        garden_id: The garden identifier (e.g. 'demo-garden-1').
         instance_id: The plant instance identifier (e.g. 'tomato-01').
         action_type: One of: watered, pruned, fertilised, issue_found, repotted, other.
         notes: Optional free-text description of what was done.
@@ -273,7 +324,21 @@ def create_action_log(
     import uuid  # noqa: PLC0415
     from datetime import datetime, timezone  # noqa: PLC0415
 
-    # Validate action_type
+    # garden_id comes from the authorized context set by run_chat, not from
+    # the LLM.  This prevents the model from writing to a different garden.
+    garden_id = _current_garden_id()
+    if not garden_id:
+        return NO_GARDEN_CONTEXT_ERROR
+
+    # Confirm the plant exists in the authorized garden before writing.
+    # This rejects invented instance_ids and cross-garden writes in one check.
+    plant = garden_data.get_plant(garden_id, instance_id)
+    if not plant:
+        return (
+            f"Error: Plant '{instance_id}' not found in your garden. "
+            "Use get_garden_plants to find valid plant IDs. "
+            "To add a new plant, use add_plant instead."
+        )
     valid_types = {"watered", "pruned", "fertilised", "issue_found", "repotted", "other"}
     if action_type not in valid_types:
         return f"Invalid action_type '{action_type}'. Must be one of: {sorted(valid_types)}"
@@ -310,14 +375,70 @@ def create_action_log(
         item=item,
     )
 
-    plant = garden_data.get_plant(garden_id, instance_id)
-    nickname = plant.get("nickname", instance_id) if plant else instance_id
+    nickname = plant.get("nickname", instance_id)
 
     logger.info(
         "Action log created: garden_id=%s instance_id=%s action_type=%s action_id=%s",
         garden_id, instance_id, action_type, action_id,
     )
     return f"Action log saved: {action_type} for '{nickname}' (action_id={action_id})."
+
+
+@tool
+def add_plant(
+    species_id: str,
+    nickname: str,
+    emoji: str = "",
+    garden_location: str = "",
+) -> str:
+    """Add a new plant to the current user's garden.
+
+    Call get_plant_species first to confirm the species_id exists.
+
+    Args:
+        species_id: Lowercase hyphenated scientific name (e.g. 'rosa', 'solanum-lycopersicum').
+        nickname: A friendly name for the plant (e.g. 'Big Red').
+        emoji: Optional emoji for the plant (e.g. '🌹').
+        garden_location: Optional location in the garden (e.g. 'South bed').
+    """
+    import uuid  # noqa: PLC0415
+
+    # The target garden comes from the authorized context, never from the model.
+    garden_id = _current_garden_id()
+    if not garden_id:
+        return NO_GARDEN_CONTEXT_ERROR
+
+    # Same checks as POST /api/v1/plants.
+    if not species_id or not nickname:
+        return "Error: 'species_id' and 'nickname' are both required."
+
+    species_data = species_dal.get_species(species_id)
+    if not species_data:
+        return (
+            f"Error: Species '{species_id}' not found. Species IDs are lowercase "
+            "hyphenated scientific names, e.g. 'rosa' or 'solanum-lycopersicum'."
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    instance_id = str(uuid.uuid4())
+
+    item = {
+        "species_id": species_id,
+        "nickname": nickname,
+        "emoji": emoji or None,
+        "garden_location": garden_location or None,
+        "planted_at": now,
+        "status": "thriving",
+        "updated_at": now,
+    }
+    garden_data.put_plant(garden_id, instance_id, item)
+
+    logger.info(
+        "Plant added by agent: garden_id=%s instance_id=%s species_id=%s",
+        garden_id, instance_id, species_id,
+    )
+    common_name = species_data.get("common_name", species_id)
+    return f"Plant added: '{nickname}' ({common_name}), instance_id={instance_id}."
 
 
 def run_chat(garden_id: str, message: str) -> str:
@@ -331,6 +452,10 @@ def run_chat(garden_id: str, message: str) -> str:
         garden_id: The garden to chat about.
         message: The user's message for this turn.
     """
+    # Lock in the authorized garden before the agent runs. Every garden tool
+    # reads it from the ContextVar, so the model cannot override it.
+    set_authorized_garden(garden_id)
+
     try:
         metadata = garden_data.get_garden_metadata(garden_id)
         latitude = metadata.get("latitude") if metadata else None
@@ -361,6 +486,7 @@ def run_chat(garden_id: str, message: str) -> str:
                 get_garden_plants,
                 get_plant_species,
                 get_recent_plant_logs,
+                add_plant,
                 create_action_log,
             ],
             model=BedrockModel(
