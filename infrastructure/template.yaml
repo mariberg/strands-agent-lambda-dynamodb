@@ -26,9 +26,18 @@ Parameters:
     Type: String
     Default: ""
     Description: S3 key for Lambda deployment zip
+  ReservedConcurrency:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    Description: >
+      Concurrent executions reserved for the function, as a cost ceiling on the
+      public URL. Set to 0 to reserve none. Lambda must keep 10 executions
+      unreserved per account, so accounts with a total limit of 10 need 0.
 
 Conditions:
   HasS3Code: !Not [!Equals [!Ref CodeS3Bucket, ""]]
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, "0"]]
 
 Resources:
 
@@ -111,7 +120,11 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Timeout: 300
       MemorySize: 256
-      ReservedConcurrentExecutions: 5  # cost ceiling — prevents runaway invocations on the public URL
+      # Cost ceiling on the public URL. Omitted when ReservedConcurrency is 0.
+      ReservedConcurrentExecutions: !If
+        - HasReservedConcurrency
+        - !Ref ReservedConcurrency
+        - !Ref AWS::NoValue
       Code:
         !If
           - HasS3Code
@@ -152,12 +165,19 @@ Resources:
       Principal: "*"
       FunctionUrlAuthType: NONE
 
+  # Function URLs need both InvokeFunctionUrl and InvokeFunction. The
+  # InvokedViaFunctionUrl condition limits this public grant to calls that come
+  # through the URL. Without it, any AWS principal could invoke the function
+  # directly with an arbitrary payload, e.g. an "async_task" naming any
+  # garden_id. The async self-invoke doesn't need this grant: it is allowed by
+  # the execution role's LambdaSelfInvoke policy.
   ApiFunctionInvokePermission:
     Type: AWS::Lambda::Permission
     Properties:
       FunctionName: !Ref ApiFunction
       Action: lambda:InvokeFunction
       Principal: "*"
+      InvokedViaFunctionUrl: true
 
 Outputs:
   FunctionUrl:

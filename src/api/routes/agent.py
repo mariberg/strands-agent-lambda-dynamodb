@@ -21,9 +21,10 @@ router = Router()
 def session_open(garden_id: str, user_id: str) -> tuple:
     """POST /api/v1/agent/session-open — kick off an async agent session.
 
-    The agent queries the garden state, refreshes the dashboard summary, and
-    can write action logs or update plant statuses. The request returns
-    immediately with 202; the agent runs fire-and-forget via Lambda self-invoke.
+    The agent reads the garden's plants, species and recent logs, checks the
+    weather, and saves a refreshed dashboard summary. It has no tools for
+    changing plants or logs. The request returns immediately with 202; the
+    agent runs fire-and-forget via Lambda self-invoke.
     """
     from src.api.router import _get_request_id  # noqa: PLC0415
     from src.api.async_trigger import trigger_async  # noqa: PLC0415

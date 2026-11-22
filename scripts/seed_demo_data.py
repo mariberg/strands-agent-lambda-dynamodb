@@ -3,6 +3,11 @@
 
 Usage:
     python scripts/seed_demo_data.py [--env demo] [--region eu-west-2]
+                                     [--garden-id demo-garden-1] [--user-id demo-user-1]
+
+--garden-id and --user-id must match the stack's DemoGardenId and DemoUserId
+parameters (infrastructure/template.yaml), since those are the IDs the Lambda
+serves. The defaults match the template defaults.
 """
 import argparse
 import boto3
@@ -12,12 +17,14 @@ from decimal import Decimal
 parser = argparse.ArgumentParser()
 parser.add_argument("--env", default="demo")
 parser.add_argument("--region", default="eu-west-2")
+parser.add_argument("--garden-id", default="demo-garden-1")
+parser.add_argument("--user-id", default="demo-user-1")
 args = parser.parse_args()
 
 dynamodb = boto3.resource("dynamodb", region_name=args.region)
 
-GARDEN_ID = "demo-garden-1"
-USER_ID = "demo-user-1"
+GARDEN_ID = args.garden_id
+USER_ID = args.user_id
 NOW = datetime.now(timezone.utc).isoformat()
 
 table = dynamodb.Table(f"GardenApp-{args.env}")
