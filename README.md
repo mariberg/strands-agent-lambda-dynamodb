@@ -23,6 +23,7 @@ Minimal demo of a gardening agent: AWS Lambda + DynamoDB single-table + Strands 
 - **Binding** — `run_chat` and `run_session_open` in `src/api/agent_runner.py` bind the garden to a per-request context before the agent starts.
 - **Tool schemas** — no garden tool takes `garden_id` or `user_id`, so the schema sent to the model has no field for one. Each tool reads the garden from the context and refuses to run without it.
 - **Ownership checks** — `garden_service` rejects writes to plants that aren't in the bound garden, which covers invented IDs and other users' plants.
+- **Narrow tools only** — the agents have no general-purpose tools. Weather comes from `get_weather`, which takes no input: it calls a fixed Open-Meteo URL with the garden's stored coordinates. The model decides when to ask for weather, never which URL is called or what is sent.
 - **System prompt** — tells the model to decline requests about other users. This is a soft layer that shapes behaviour. The code above is what guarantees another user's data can't be touched.
 
 The tests in `tests/` fail if any of these guardrails is removed.
@@ -36,7 +37,7 @@ The tests in `tests/` fail if any of these guardrails is removed.
 
 ## Running the tests
 
-The tests run locally with no AWS credentials and no environment variables. Strands is stubbed out and every DynamoDB call is mocked.
+The tests run locally with no AWS credentials, no environment variables and no network access. Strands is stubbed out, and every DynamoDB call and the weather API are mocked.
 
 One-time setup, from the project root:
 
@@ -68,7 +69,7 @@ Then run:
 
 | File | What it covers |
 |---|---|
-| `test_garden_tool_guardrails.py` | Guardrails on the deployed agent tools in `src/api/agent_runner.py`: no tool accepts `garden_id`/`user_id`, the runners bind the garden before the agent runs, tools refuse without a bound garden, writes to plants outside the garden are rejected, reads only touch the bound garden, and injected IDs fail. Also checks that the agent tools and the REST routes both write through `garden_service` and produce identical items. |
+| `test_garden_tool_guardrails.py` | Guardrails on the deployed agent tools in `src/api/agent_runner.py`: no tool accepts `garden_id`/`user_id`, the runners bind the garden before the agent runs, tools refuse without a bound garden, writes to plants outside the garden are rejected, reads only touch the bound garden, `get_weather` only calls Open-Meteo with the stored coordinates, and injected IDs fail. Also checks that the agent tools and the REST routes both write through `garden_service` and produce identical items. |
 | `test_garden_service.py` | The shared write rules in `src/api/services/garden_service.py`: required fields, valid action types, severities and timestamps, plant ownership, and the exact item format written to DynamoDB. Bad input is rejected, never silently dropped. |
 
 The tests check the code, not the model's behaviour. Whether the model follows the system prompt (for example, declining a request about another user) needs a manual check against the deployed Lambda.

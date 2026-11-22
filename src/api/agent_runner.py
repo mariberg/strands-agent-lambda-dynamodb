@@ -4,15 +4,17 @@ The agent reads the current garden state, fetches local weather, and writes
 a refreshed dashboard summary back to DynamoDB.
 """
 
+import json
 import logging
 import os
+import urllib.parse
+import urllib.request
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Optional
 
 from strands import Agent, tool
 from strands.models.bedrock import BedrockModel
-from strands.vended_tools import http_request
 
 from src.api.dal import garden_data, species as species_dal
 from src.api.enums import ActionType, LoggedBy, Severity
@@ -81,8 +83,8 @@ The tools are already scoped to the garden you are assessing. Follow these steps
    requirements (temperature tolerance, watering frequency, sunlight needs, etc.).
 3. For each plant, call get_recent_plant_logs with its instance_id
    to understand recent activity (watering, notes, etc.).
-4. Call http_request to fetch current weather from the Open-Meteo API for the
-   garden location provided in the prompt. Use GET with the URL provided.
+4. Call get_weather to get current conditions and a 3-day forecast for the
+   garden. If it returns an error, continue without weather.
 5. Synthesise everything into:
    - An overall garden health assessment
    - Per-plant highlights: status, what needs attention, and any weather-related risks
@@ -175,6 +177,66 @@ def get_recent_plant_logs(instance_id: str) -> list:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Weather
+# ---------------------------------------------------------------------------
+# A narrow tool in place of a general HTTP tool. The URL is fixed in code and
+# the coordinates come from the garden's stored metadata, so the model can only
+# decide *when* to ask for weather, never where a request goes or what it sends.
+
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_TIMEOUT_SECONDS = 10
+WEATHER_UNAVAILABLE_ERROR = "Error: The weather service is unavailable right now."
+
+
+def _fetch_json(url: str) -> dict:
+    """GET a URL and parse the JSON body. Kept separate so tests can replace it."""
+    with urllib.request.urlopen(url, timeout=WEATHER_TIMEOUT_SECONDS) as resp:  # noqa: S310 (fixed https URL)
+        return json.loads(resp.read())
+
+
+@tool
+def get_weather() -> dict:
+    """Get current weather and a 3-day forecast for the current user's garden.
+
+    The garden's location is looked up automatically. Returns current
+    temperature, humidity, wind speed and precipitation, plus daily max/min
+    temperature, total precipitation and max wind speed for the next 3 days,
+    with the units for each value.
+    """
+    garden_id = _current_garden_id()
+    if not garden_id:
+        return {"error": NO_GARDEN_CONTEXT_ERROR}
+
+    metadata = garden_data.get_garden_metadata(garden_id) or {}
+    latitude, longitude = metadata.get("latitude"), metadata.get("longitude")
+    if latitude is None or longitude is None:
+        return {"error": "Error: No location is stored for this garden, so weather is unavailable."}
+
+    query = urllib.parse.urlencode({
+        "latitude": float(latitude),
+        "longitude": float(longitude),
+        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation",
+        "daily": "temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max",
+        "forecast_days": 3,
+        "timezone": "auto",
+    })
+    try:
+        data = _fetch_json(f"{OPEN_METEO_URL}?{query}")
+    except (OSError, ValueError) as exc:  # network errors, timeouts, bad JSON
+        logger.warning("Weather fetch failed for garden_id=%s: %s", garden_id, exc)
+        return {"error": WEATHER_UNAVAILABLE_ERROR}
+
+    # Return only what the agent needs, not the raw API response.
+    return {
+        "location": metadata.get("city"),
+        "current": data.get("current", {}),
+        "current_units": data.get("current_units", {}),
+        "daily": data.get("daily", {}),
+        "daily_units": data.get("daily_units", {}),
+    }
+
+
 @tool
 def save_dashboard_summary(summary_text: str, plant_highlights: dict) -> str:
     """Save the generated dashboard summary for the current garden.
@@ -224,30 +286,12 @@ def run_session_open(garden_id: str) -> None:
             logger.error("run_session_open: no garden metadata for garden_id=%s", garden_id)
             return
 
-        latitude = metadata.get("latitude")
-        longitude = metadata.get("longitude")
-        city = metadata.get("city", "the garden location")
-
-        weather_instruction = ""
-        if latitude is not None and longitude is not None:
-            weather_url = (
-                f"https://api.open-meteo.com/v1/forecast"
-                f"?latitude={latitude}&longitude={longitude}"
-                f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation"
-                f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max"
-                f"&forecast_days=3&timezone=auto"
-            )
-            weather_instruction = (
-                f"The garden is in {city} (lat={latitude}, lon={longitude}). "
-                f"Fetch current weather and a 3-day forecast using http_request GET: {weather_url}"
-            )
-        else:
-            weather_instruction = "No location data is available for this garden; skip the weather step."
+        city = metadata.get("city", "an unknown location")
 
         agent = Agent(
             system_prompt=SYSTEM_PROMPT,
             tools=[
-                http_request,
+                get_weather,
                 get_garden_plants,
                 get_plant_species,
                 get_recent_plant_logs,
@@ -260,8 +304,7 @@ def run_session_open(garden_id: str) -> None:
         )
 
         prompt = (
-            f"Please assess the garden and generate a dashboard summary.\n\n"
-            f"{weather_instruction}\n\n"
+            f"Please assess the garden in {city} and generate a dashboard summary.\n\n"
             f"Work through the steps in your instructions, then call save_dashboard_summary."
         )
 
@@ -321,8 +364,8 @@ When the user asks to add a new plant to their own garden:
 Never use create_action_log to add a plant. It only records actions on plants
 that already exist.
 
-If the user asks about weather, use http_request to fetch it from Open-Meteo using
-the garden coordinates provided in your first message.
+If the user asks about weather, call get_weather. It already knows the garden's
+location, so you don't need to ask for one.
 Be concise, warm, and practical. Always end your response with a plain-text message
 to the user — never finish on a tool call or a thinking block alone. Do not wrap
 your response in <thinking> tags — write your answer directly as plain text."""
@@ -439,24 +482,11 @@ def run_chat(garden_id: str, message: str) -> str:
     set_authorized_garden(garden_id)
 
     try:
-        metadata = garden_data.get_garden_metadata(garden_id)
-        latitude = metadata.get("latitude") if metadata else None
-        longitude = metadata.get("longitude") if metadata else None
-        city = metadata.get("city", "the garden location") if metadata else "the garden"
-
-        if latitude is not None and longitude is not None:
-            weather_url = (
-                f"https://api.open-meteo.com/v1/forecast"
-                f"?latitude={latitude}&longitude={longitude}"
-                f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation"
-                f"&forecast_days=3&timezone=auto"
-            )
-            location_context = (
-                f"The garden is in {city} (lat={latitude}, lon={longitude}). "
-                f"If the user asks about weather, fetch it via GET: {weather_url}"
-            )
-        else:
-            location_context = "No location data is available for this garden."
+        metadata = garden_data.get_garden_metadata(garden_id) or {}
+        city = metadata.get("city")
+        location_context = (
+            f"The garden is in {city}." if city else "The garden's city isn't recorded."
+        )
 
         # Load saved conversation history (single session per garden — see garden_data.py)
         history = garden_data.get_chat_session(garden_id)
@@ -464,7 +494,7 @@ def run_chat(garden_id: str, message: str) -> str:
         agent = Agent(
             system_prompt=f"{CHAT_SYSTEM_PROMPT}\n\nGarden context: {location_context}",
             tools=[
-                http_request,
+                get_weather,
                 get_garden_plants,
                 get_plant_species,
                 get_recent_plant_logs,

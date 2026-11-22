@@ -31,4 +31,3 @@ _strands_stub.tool = lambda f: f
 sys.modules["strands"] = _strands_stub
 sys.modules["strands.models"] = MagicMock()
 sys.modules["strands.models.bedrock"] = MagicMock()
-sys.modules["strands.vended_tools"] = MagicMock()

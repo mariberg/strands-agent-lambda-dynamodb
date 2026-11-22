@@ -15,7 +15,9 @@ Areas covered:
 2. Context binding   - the runners bind the garden and register only scoped tools.
 3. No context        - every tool refuses to touch the DB without a bound garden.
 4. Plant ownership   - writes to plants outside the bound garden are rejected.
-5. Scoped reads      - reads only ever query the bound garden.
+5. Scoped reads      - reads only ever query the bound garden. Weather comes from
+                       a fixed URL and the garden's stored coordinates, never
+                       from a model-supplied URL or location.
 6. Input validation  - bad values are rejected (never silently dropped) and
                        the model gets the reason back.
 7. Shared write path - the agent tools and the REST routes both write through
@@ -27,6 +29,9 @@ The validation rules themselves are tested once, in test_garden_service.py.
 
 import inspect
 import json
+import urllib.error
+import urllib.parse
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -50,6 +55,7 @@ FAKE_PLANTS = {
 # Every tool that reads or writes garden data. Each must get its garden from
 # the authorized context, never from a parameter.
 GARDEN_TOOLS = [
+    ar.get_weather,
     ar.get_garden_plants,
     ar.get_recent_plant_logs,
     ar.save_dashboard_summary,
@@ -60,6 +66,7 @@ GARDEN_TOOLS = [
 # The full parameter list of each tool is pinned. Adding any parameter fails a
 # test, so a garden_id can't be slipped back in without someone noticing.
 EXPECTED_PARAMS = {
+    "get_weather": set(),
     "get_garden_plants": set(),
     "get_recent_plant_logs": {"instance_id"},
     "save_dashboard_summary": {"summary_text", "plant_highlights"},
@@ -73,6 +80,7 @@ FORBIDDEN_PARAMS = {"garden_id", "user_id", "owner_id", "authorized_garden", "ov
 # Valid arguments for each tool, used to show the only thing wrong in the
 # injection tests is the extra ID.
 VALID_ARGS = {
+    "get_weather": {},
     "get_garden_plants": {},
     "get_recent_plant_logs": {"instance_id": "rose-01"},
     "save_dashboard_summary": {"summary_text": "All good.", "plant_highlights": {}},
@@ -101,11 +109,28 @@ def no_garden_context():
     ar._authorized_garden_id.reset(token)
 
 
+FAKE_GARDENS = {
+    AUTHORIZED_GARDEN: {"city": "London", "latitude": Decimal("51.5074"), "longitude": Decimal("-0.1278")},
+    OTHER_GARDEN: {"city": "Oslo", "latitude": Decimal("59.9139"), "longitude": Decimal("10.7522")},
+}
+
+FAKE_WEATHER_RESPONSE = {
+    "latitude": 51.5, "longitude": -0.12, "generationtime_ms": 0.1, "elevation": 11.0,
+    "current_units": {"temperature_2m": "°C"},
+    "current": {"time": "2026-11-21T10:00", "temperature_2m": 7.4},
+    "daily_units": {"temperature_2m_max": "°C"},
+    "daily": {"time": ["2026-11-21"], "temperature_2m_max": [9.1]},
+}
+
+
 @pytest.fixture
 def dal():
-    """Replace every DAL call the tools make with a mock. Nothing touches AWS."""
+    """Replace every DAL call and the weather API with mocks. Nothing touches AWS or the network."""
     with patch.object(ar.garden_data, "get_plant",
                       side_effect=lambda g, i: FAKE_PLANTS.get((g, i))) as get_plant, \
+         patch.object(ar.garden_data, "get_garden_metadata",
+                      side_effect=lambda g: FAKE_GARDENS.get(g)) as get_metadata, \
+         patch.object(ar, "_fetch_json", return_value=FAKE_WEATHER_RESPONSE) as fetch_json, \
          patch.object(ar.garden_data, "put_plant") as put_plant, \
          patch.object(ar.garden_data, "put_log") as put_log, \
          patch.object(ar.garden_data, "list_plants", return_value=[]) as list_plants, \
@@ -115,6 +140,8 @@ def dal():
                       side_effect=lambda s: {"common_name": "Rose"} if s == "rosa" else None) as get_species:
         yield {
             "get_plant": get_plant,
+            "get_garden_metadata": get_metadata,
+            "fetch_json": fetch_json,
             "put_plant": put_plant,
             "put_log": put_log,
             "list_plants": list_plants,
@@ -131,9 +158,11 @@ def assert_nothing_written(dal):
 
 
 def is_error(result) -> bool:
-    """Tools return either an 'Error...' string or a list with an error dict."""
+    """Tools return an 'Error...' string, an error dict, or a list with an error dict."""
     if isinstance(result, str):
         return result.startswith("Error") or result.startswith("Invalid")
+    if isinstance(result, dict):
+        return "error" in result
     if isinstance(result, list):
         return bool(result) and "error" in result[0]
     return False
@@ -206,13 +235,45 @@ class TestRunnersBindGarden:
             lambda: ar.run_chat(AUTHORIZED_GARDEN, "hello")
         )
         assert tools == [
-            ar.http_request,
+            ar.get_weather,
             ar.get_garden_plants,
             ar.get_plant_species,
             ar.get_recent_plant_logs,
             ar.add_plant,
             ar.create_action_log,
         ]
+
+    def test_session_agent_registers_only_known_tools(self):
+        """Same for the session-open agent: read-only tools plus the dashboard save."""
+        _, tools = self._capture_garden_during_agent_call(
+            lambda: ar.run_session_open(AUTHORIZED_GARDEN)
+        )
+        assert tools == [
+            ar.get_weather,
+            ar.get_garden_plants,
+            ar.get_plant_species,
+            ar.get_recent_plant_logs,
+            ar.save_dashboard_summary,
+        ]
+
+    @pytest.mark.parametrize("run", [
+        lambda: ar.run_chat(AUTHORIZED_GARDEN, "hello"),
+        lambda: ar.run_session_open(AUTHORIZED_GARDEN),
+    ], ids=["chat", "session_open"])
+    def test_prompts_contain_no_coordinates_or_urls(self, run):
+        """The weather tool looks up the location itself, so the model never sees it."""
+        with patch.object(ar, "Agent") as MockAgent, \
+             patch.object(ar.garden_data, "get_garden_metadata", return_value=FAKE_GARDENS[AUTHORIZED_GARDEN]), \
+             patch.object(ar.garden_data, "get_chat_session", return_value=[]), \
+             patch.object(ar.garden_data, "put_chat_session"):
+            MockAgent.return_value.return_value = "ok"
+            run()
+            system_prompt = MockAgent.call_args.kwargs["system_prompt"]
+            user_prompt = " ".join(str(c.args[0]) for c in MockAgent.return_value.call_args_list)
+
+        for text in (system_prompt, user_prompt):
+            assert "51.5074" not in text and "-0.1278" not in text
+            assert "http" not in text.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +339,52 @@ class TestScopedReads:
     def test_save_dashboard_summary_writes_bound_garden(self, dal):
         ar.save_dashboard_summary("All good.", {})
         assert dal["put_dashboard_summary"].call_args.args[0] == AUTHORIZED_GARDEN
+
+
+class TestWeatherTool:
+    """
+    get_weather replaces a general HTTP tool. The model can only decide *when*
+    to ask for weather. The URL is fixed in code and the coordinates come from
+    the bound garden's stored metadata.
+    """
+
+    def _requested_url(self, dal) -> urllib.parse.ParseResult:
+        return urllib.parse.urlparse(dal["fetch_json"].call_args.args[0])
+
+    def test_only_calls_the_open_meteo_forecast_endpoint(self, dal):
+        ar.get_weather()
+        url = self._requested_url(dal)
+        assert (url.scheme, url.netloc, url.path) == ("https", "api.open-meteo.com", "/v1/forecast")
+
+    def test_coordinates_come_from_the_bound_gardens_metadata(self, dal):
+        ar.get_weather()
+        dal["get_garden_metadata"].assert_called_once_with(AUTHORIZED_GARDEN)
+        query = urllib.parse.parse_qs(self._requested_url(dal).query)
+        assert query["latitude"] == ["51.5074"]
+        assert query["longitude"] == ["-0.1278"]
+
+    def test_returns_trimmed_result_not_raw_response(self, dal):
+        result = ar.get_weather()
+        assert set(result) == {"location", "current", "current_units", "daily", "daily_units"}
+        assert result["location"] == "London"
+
+    def test_no_stored_location_returns_error_without_a_request(self, dal):
+        dal["get_garden_metadata"].side_effect = lambda g: {"city": "Nowhere"}
+        assert is_error(ar.get_weather())
+        dal["fetch_json"].assert_not_called()
+
+    @pytest.mark.parametrize("failure", [
+        urllib.error.URLError("connection refused"),
+        TimeoutError("timed out"),
+        ValueError("bad JSON"),
+    ], ids=["network", "timeout", "bad_json"])
+    def test_api_failure_returns_error_instead_of_raising(self, dal, failure):
+        dal["fetch_json"].side_effect = failure
+        assert ar.get_weather() == {"error": ar.WEATHER_UNAVAILABLE_ERROR}
+
+    def test_agent_runner_has_no_general_http_tool(self):
+        """Tripwire: a general-purpose HTTP tool would let the model choose any URL."""
+        assert not hasattr(ar, "http_request")
 
 
 # ---------------------------------------------------------------------------
