@@ -16,23 +16,26 @@ Areas covered:
 3. No context        - every tool refuses to touch the DB without a bound garden.
 4. Plant ownership   - writes to plants outside the bound garden are rejected.
 5. Scoped reads      - reads only ever query the bound garden.
-6. Input validation  - bad action types and species are rejected before writing.
-7. Shared rules      - the agent tool and REST endpoint accept the same action types.
+6. Input validation  - bad values are rejected (never silently dropped) and
+                       the model gets the reason back.
+7. Shared write path - the agent tools and the REST routes both write through
+                       garden_service, and produce identical DynamoDB items.
 8. ID injection      - a model-supplied garden_id/user_id is rejected outright.
 
-Dates: the agent tools don't take a date (create_action_log stamps the current
-time), so there is no date input on the agent path to validate.
+The validation rules themselves are tested once, in test_garden_service.py.
 """
 
 import inspect
-from unittest.mock import patch
+import json
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-# conftest.py stubs strands/boto3 and sets sys.path before this import.
+# conftest.py stubs strands and sets sys.path before these imports.
 from src.api import agent_runner as ar
-from src.api.enums import ActionType, validate_enum
-from src.api.errors import ApiError
+from src.api import router
+from src.api.enums import ActionType, Severity
+from src.api.services import garden_service
 
 AUTHORIZED_GARDEN = "demo-garden-1"
 OTHER_GARDEN = "demo-garden-4"
@@ -289,9 +292,17 @@ class TestInputValidation:
         assert is_error(result)
         assert_nothing_written(dal)
 
-    def test_invalid_severity_is_dropped_not_stored(self, dal):
-        ar.create_action_log("rose-01", "issue_found", severity="catastrophic")
-        assert "severity" not in dal["put_log"].call_args.kwargs["item"]
+    def test_invalid_severity_rejected_with_reason(self, dal):
+        """Rejected, not dropped: the model gets the valid values back and can retry."""
+        result = ar.create_action_log("rose-01", "issue_found", severity="catastrophic")
+        assert is_error(result)
+        assert "severity" in result
+        assert_nothing_written(dal)
+
+    def test_unknown_plant_error_points_model_to_the_right_tools(self, dal):
+        result = ar.create_action_log("lemon-tree-99", "watered")
+        assert "get_garden_plants" in result
+        assert "add_plant" in result
 
     def test_unknown_species_rejected(self, dal):
         result = ar.add_plant("not-a-real-species", "Mystery")
@@ -306,26 +317,133 @@ class TestInputValidation:
 
 
 # ---------------------------------------------------------------------------
-# 7. Agent tool and REST endpoint agree on the rules
+# 7. Shared write path: agent tools and REST routes use garden_service
 # ---------------------------------------------------------------------------
 
-class TestAgentAndRestAgree:
+FROZEN_NOW = "2026-06-01T09:00:00+00:00"
+
+
+def function_url_event(method: str, path: str, body: dict) -> dict:
+    """Minimal Lambda Function URL (payload v2) event for the real router."""
+    return {
+        "version": "2.0",
+        "routeKey": "$default",
+        "rawPath": path,
+        "rawQueryString": "",
+        "headers": {"content-type": "application/json"},
+        "requestContext": {
+            "http": {"method": method, "path": path, "protocol": "HTTP/1.1",
+                     "sourceIp": "127.0.0.1", "userAgent": "pytest"},
+            "requestId": "test-request",
+            "routeKey": "$default",
+            "stage": "$default",
+        },
+        "body": json.dumps(body),
+        "isBase64Encoded": False,
+    }
+
+
+def call_rest(method: str, path: str, body: dict) -> dict:
+    """Send a request through src.api.router.lambda_handler, as the Lambda does."""
+    return router.lambda_handler(function_url_event(method, path, body), MagicMock())
+
+
+@pytest.fixture
+def frozen_clock():
+    """Fix the service's clock so items written at different moments compare equal."""
+    with patch.object(garden_service, "_now_iso", return_value=FROZEN_NOW):
+        yield
+
+
+class TestSharedWritePath:
     """
-    POST /plants/{id}/action-logs validates action_type with validate_enum and
-    the ActionType enum. create_action_log keeps its own copy of the list.
-    These tests catch the two drifting apart. A single shared validation
-    function would remove the duplication, and this test would then pin it.
+    Both the agent tools and the REST routes write through garden_service.
+    Validation and item format live there once. These tests fail if either
+    path starts building or validating items on its own again.
     """
 
-    @pytest.mark.parametrize("action_type", [a.value for a in ActionType])
-    def test_every_rest_action_type_accepted_by_tool(self, dal, action_type):
-        assert not is_error(ar.create_action_log("rose-01", action_type))
+    # The REST routes get the garden from require_garden (DEMO_GARDEN_ID),
+    # which defaults to the same garden the agent tests are bound to.
 
-    @pytest.mark.parametrize("bad_type", ["sprayed", "fertilized", "harvested"])
-    def test_types_rest_rejects_are_rejected_by_tool(self, dal, bad_type):
-        with pytest.raises(ApiError):
-            validate_enum("action_type", bad_type, ActionType)
-        assert is_error(ar.create_action_log("rose-01", bad_type))
+    def test_agent_add_plant_uses_service(self, dal):
+        with patch.object(garden_service, "create_plant",
+                          wraps=garden_service.create_plant) as spy:
+            ar.add_plant("rosa", "Rose")
+        assert spy.call_args.args[0] == AUTHORIZED_GARDEN
+
+    def test_rest_create_plant_uses_service(self, dal):
+        with patch.object(garden_service, "create_plant",
+                          wraps=garden_service.create_plant) as spy:
+            resp = call_rest("POST", "/api/v1/plants", {"species_id": "rosa", "nickname": "Rose"})
+        assert resp["statusCode"] == 201
+        assert spy.call_args.args[0] == AUTHORIZED_GARDEN
+
+    def test_agent_action_log_uses_service(self, dal):
+        with patch.object(garden_service, "create_action_log",
+                          wraps=garden_service.create_action_log) as spy:
+            ar.create_action_log("rose-01", "watered")
+        assert spy.call_args.args[:2] == (AUTHORIZED_GARDEN, "rose-01")
+
+    def test_rest_action_log_uses_service(self, dal):
+        with patch.object(garden_service, "create_action_log",
+                          wraps=garden_service.create_action_log) as spy:
+            resp = call_rest("POST", "/api/v1/plants/rose-01/action-logs", {"action_type": "watered"})
+        assert resp["statusCode"] == 201
+        assert spy.call_args.args[:2] == (AUTHORIZED_GARDEN, "rose-01")
+
+    def test_same_plant_produces_identical_items(self, dal, frozen_clock):
+        call_rest("POST", "/api/v1/plants", {
+            "species_id": "rosa", "nickname": "Rose", "emoji": "🌹", "garden_location": "South bed",
+        })
+        ar.add_plant("rosa", "Rose", emoji="🌹", garden_location="South bed")
+
+        (rest_call, agent_call) = dal["put_plant"].call_args_list
+        assert rest_call.args[0] == agent_call.args[0]   # same garden
+        assert rest_call.args[2] == agent_call.args[2]   # same item
+
+    def test_same_action_produces_identical_items(self, dal, frozen_clock):
+        # logged_by is the one field that differs by design, so pass it explicitly.
+        call_rest("POST", "/api/v1/plants/rose-01/action-logs", {
+            "action_type": "issue_found", "severity": "mild",
+            "title": "Aphids", "notes": "On new growth", "logged_by": "agent",
+        })
+        ar.create_action_log("rose-01", "issue_found", notes="On new growth",
+                             title="Aphids", severity="mild")
+
+        (rest_call, agent_call) = dal["put_log"].call_args_list
+        for field in ("garden_id", "instance_id", "occurred_at", "item"):
+            assert rest_call.kwargs[field] == agent_call.kwargs[field], field
+
+    def test_agent_actions_are_marked_as_agent(self, dal):
+        ar.create_action_log("rose-01", "watered")
+        assert dal["put_log"].call_args.kwargs["item"]["logged_by"] == "agent"
+
+    def test_same_bad_input_rejected_on_both_paths(self, dal):
+        """One rule, two paths: REST returns 400, the agent gets the same message."""
+        resp = call_rest("POST", "/api/v1/plants/rose-01/action-logs",
+                         {"action_type": "watered", "severity": "catastrophic"})
+        agent_result = ar.create_action_log("rose-01", "watered", severity="catastrophic")
+
+        assert resp["statusCode"] == 400
+        rest_message = json.loads(resp["body"])["message"]
+        assert agent_result == f"Error: {rest_message}"
+        assert_nothing_written(dal)
+
+
+class TestModelFacingValuesMatchEnums:
+    """The prompt and tool description list exactly what the service accepts."""
+
+    def test_tool_description_lists_every_action_type(self):
+        for action in ActionType:
+            assert action.value in ar.create_action_log.__doc__
+
+    def test_tool_description_lists_every_severity(self):
+        for severity in Severity:
+            assert severity.value in ar.create_action_log.__doc__
+
+    def test_chat_prompt_lists_every_action_type(self):
+        for action in ActionType:
+            assert action.value in ar.CHAT_SYSTEM_PROMPT
 
 
 # ---------------------------------------------------------------------------

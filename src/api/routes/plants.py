@@ -5,14 +5,12 @@
   GET  /api/v1/plants/{instance_id} — get a single plant
 """
 
-import uuid
-from datetime import datetime, timezone
-
 from aws_lambda_powertools.event_handler.api_gateway import Router
 
 from src.api.dal import garden_data, species
 from src.api.errors import ApiError
 from src.api.middleware import require_garden
+from src.api.services import garden_service
 
 router = Router()
 
@@ -88,39 +86,24 @@ def create_plant(garden_id: str, user_id: str) -> tuple:
 
     body = app.current_event.json_body or {}
 
-    species_id = body.get("species_id")
-    nickname = body.get("nickname")
-
-    missing = [f for f, v in [("species_id", species_id), ("nickname", nickname)] if not v]
-    if missing:
-        raise ApiError(400, "missing_field", f"Required field(s) missing: {missing}.")
-
-    # Validate species exists
-    species_data = species.get_species(species_id)
-    if not species_data:
-        raise ApiError(400, "not_found", f"Species '{species_id}' not found.")
-
-    now = datetime.now(timezone.utc).isoformat()
-    instance_id = str(uuid.uuid4())
-
-    item = {
-        "species_id": species_id,
-        "nickname": nickname,
-        "emoji": body.get("emoji"),
-        "garden_location": body.get("garden_location"),
-        "planted_at": body.get("planted_at") or now,
-        "status": "thriving",
-        "updated_at": now,
-    }
-
-    garden_data.put_plant(garden_id, instance_id, item)
+    # Validation, item format and the write are shared with the agent's
+    # add_plant tool. Invalid input raises ApiError, which the router turns
+    # into a 4xx response.
+    created = garden_service.create_plant(
+        garden_id,
+        species_id=body.get("species_id"),
+        nickname=body.get("nickname"),
+        emoji=body.get("emoji"),
+        garden_location=body.get("garden_location"),
+        planted_at=body.get("planted_at"),
+    )
 
     import json  # noqa: PLC0415
     from aws_lambda_powertools.event_handler.api_gateway import Response  # noqa: PLC0415
 
     response_body = _build_plant_response(
-        {**item, "sk": f"PLANT#{instance_id}"},
-        species_data,
+        {**created.item, "instance_id": created.instance_id},
+        created.species,
     )
     return Response(
         status_code=201,

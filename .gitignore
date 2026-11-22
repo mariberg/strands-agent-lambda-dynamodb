@@ -6,6 +6,7 @@ package/
 function.zip
 
 # Python
+.venv/
 __pycache__/
 *.pyc
 *.pyo

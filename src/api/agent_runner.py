@@ -15,6 +15,33 @@ from strands.models.bedrock import BedrockModel
 from strands.vended_tools import http_request
 
 from src.api.dal import garden_data, species as species_dal
+from src.api.enums import ActionType, LoggedBy, Severity
+from src.api.errors import ApiError
+from src.api.services import garden_service
+
+# ---------------------------------------------------------------------------
+# Model-facing value lists
+# ---------------------------------------------------------------------------
+# Generated from the same enums garden_service validates against, so the
+# prompt and tool descriptions can't drift from what the service accepts.
+ACTION_TYPES_TEXT = ", ".join(a.value for a in ActionType)
+SEVERITIES_TEXT = ", ".join(s.value for s in Severity)
+
+
+def _format_doc(**values):
+    """Fill {placeholders} in a tool docstring before @tool reads it."""
+    def decorate(fn):
+        fn.__doc__ = fn.__doc__.format(**values)
+        return fn
+    return decorate
+
+
+def _tool_error(exc: ApiError) -> str:
+    """Turn a service error into a tool result the model can act on."""
+    message = f"Error: {exc.message}"
+    if exc.status_code == 404:
+        message += " Use get_garden_plants to find valid plant IDs. To add a new plant, use add_plant."
+    return message
 
 # ---------------------------------------------------------------------------
 # Per-request authorization context
@@ -250,7 +277,7 @@ def run_session_open(garden_id: str) -> None:
 # Chat agent
 # ---------------------------------------------------------------------------
 
-CHAT_SYSTEM_PROMPT = """You are a friendly, knowledgeable garden assistant. You help users
+CHAT_SYSTEM_PROMPT = f"""You are a friendly, knowledgeable garden assistant. You help users
 manage their garden by answering questions and recording actions they have taken.
 
 You have tools to:
@@ -280,7 +307,7 @@ Reference plants by their nickname (e.g. "Big Red") rather than their ID.
 When the user mentions taking an action with a plant:
 1. If you don't know which plant they mean, call get_garden_plants to find it by nickname.
 2. Call create_action_log to record the action. Valid action types are:
-   watered, pruned, fertilised, issue_found, repotted, other
+   {ACTION_TYPES_TEXT}
 3. After saving, confirm clearly — for example:
    "Done — I've logged that you watered Big Red. 🌱"
 
@@ -294,7 +321,6 @@ When the user asks to add a new plant to their own garden:
 Never use create_action_log to add a plant. It only records actions on plants
 that already exist.
 
-Always set logged_by to "agent" when recording actions.
 If the user asks about weather, use http_request to fetch it from Open-Meteo using
 the garden coordinates provided in your first message.
 Be concise, warm, and practical. Always end your response with a plain-text message
@@ -303,6 +329,7 @@ your response in <thinking> tags — write your answer directly as plain text.""
 
 
 @tool
+@_format_doc(action_types=ACTION_TYPES_TEXT, severities=SEVERITIES_TEXT)
 def create_action_log(
     instance_id: str,
     action_type: str,
@@ -316,72 +343,42 @@ def create_action_log(
 
     Args:
         instance_id: The plant instance identifier (e.g. 'tomato-01').
-        action_type: One of: watered, pruned, fertilised, issue_found, repotted, other.
+        action_type: One of: {action_types}.
         notes: Optional free-text description of what was done.
         title: Optional short title for the log entry.
-        severity: Optional severity for issue_found entries: mild, moderate, or severe.
+        severity: Optional severity for issue_found entries. One of: {severities}.
     """
-    import uuid  # noqa: PLC0415
-    from datetime import datetime, timezone  # noqa: PLC0415
-
     # garden_id comes from the authorized context set by run_chat, not from
     # the LLM.  This prevents the model from writing to a different garden.
     garden_id = _current_garden_id()
     if not garden_id:
         return NO_GARDEN_CONTEXT_ERROR
 
-    # Confirm the plant exists in the authorized garden before writing.
-    # This rejects invented instance_ids and cross-garden writes in one check.
-    plant = garden_data.get_plant(garden_id, instance_id)
-    if not plant:
-        return (
-            f"Error: Plant '{instance_id}' not found in your garden. "
-            "Use get_garden_plants to find valid plant IDs. "
-            "To add a new plant, use add_plant instead."
+    # Validation, item format and the write are shared with
+    # POST /plants/{id}/action-logs. The service rejects plants outside
+    # garden_id, which covers invented IDs and other users' plants.
+    try:
+        created = garden_service.create_action_log(
+            garden_id,
+            instance_id,
+            action_type=action_type,
+            title=title,
+            notes=notes,
+            severity=severity,
+            logged_by=LoggedBy.agent.value,
         )
-    valid_types = {"watered", "pruned", "fertilised", "issue_found", "repotted", "other"}
-    if action_type not in valid_types:
-        return f"Invalid action_type '{action_type}'. Must be one of: {sorted(valid_types)}"
-
-    # Validate severity if provided
-    valid_severities = {"mild", "moderate", "severe", ""}
-    if severity not in valid_severities:
-        severity = ""
-
-    action_id = str(uuid.uuid4())
-    occurred_at = datetime.now(timezone.utc).isoformat()
-
-    item = {
-        "action_type": action_type,
-        "title": title or None,
-        "notes": notes or None,
-        "severity": severity or None,
-        "logged_by": "agent",
-        "is_draft": False,
-        "image_refs": [],
-        "resolved": False,
-    }
-    # Strip None values — DynamoDB accepts them but keeping items clean
-    item = {k: v for k, v in item.items() if v is not None}
-    item["image_refs"] = []  # always include even if empty
-    item["is_draft"] = False
-    item["resolved"] = False
-
-    garden_data.put_log(
-        garden_id=garden_id,
-        instance_id=instance_id,
-        occurred_at=occurred_at,
-        action_id=action_id,
-        item=item,
-    )
-
-    nickname = plant.get("nickname", instance_id)
+    except ApiError as exc:
+        return _tool_error(exc)
 
     logger.info(
         "Action log created: garden_id=%s instance_id=%s action_type=%s action_id=%s",
-        garden_id, instance_id, action_type, action_id,
+        garden_id, instance_id, created.item["action_type"], created.action_id,
     )
-    return f"Action log saved: {action_type} for '{nickname}' (action_id={action_id})."
+    nickname = created.plant.get("nickname", instance_id)
+    return (
+        f"Action log saved: {created.item['action_type']} for '{nickname}' "
+        f"(action_id={created.action_id})."
+    )
 
 
 @tool
@@ -401,44 +398,29 @@ def add_plant(
         emoji: Optional emoji for the plant (e.g. '🌹').
         garden_location: Optional location in the garden (e.g. 'South bed').
     """
-    import uuid  # noqa: PLC0415
-
     # The target garden comes from the authorized context, never from the model.
     garden_id = _current_garden_id()
     if not garden_id:
         return NO_GARDEN_CONTEXT_ERROR
 
-    # Same checks as POST /api/v1/plants.
-    if not species_id or not nickname:
-        return "Error: 'species_id' and 'nickname' are both required."
-
-    species_data = species_dal.get_species(species_id)
-    if not species_data:
-        return (
-            f"Error: Species '{species_id}' not found. Species IDs are lowercase "
-            "hyphenated scientific names, e.g. 'rosa' or 'solanum-lycopersicum'."
+    # Validation, item format and the write are shared with POST /plants.
+    try:
+        created = garden_service.create_plant(
+            garden_id,
+            species_id=species_id,
+            nickname=nickname,
+            emoji=emoji,
+            garden_location=garden_location,
         )
-
-    now = datetime.now(timezone.utc).isoformat()
-    instance_id = str(uuid.uuid4())
-
-    item = {
-        "species_id": species_id,
-        "nickname": nickname,
-        "emoji": emoji or None,
-        "garden_location": garden_location or None,
-        "planted_at": now,
-        "status": "thriving",
-        "updated_at": now,
-    }
-    garden_data.put_plant(garden_id, instance_id, item)
+    except ApiError as exc:
+        return _tool_error(exc)
 
     logger.info(
         "Plant added by agent: garden_id=%s instance_id=%s species_id=%s",
-        garden_id, instance_id, species_id,
+        garden_id, created.instance_id, species_id,
     )
-    common_name = species_data.get("common_name", species_id)
-    return f"Plant added: '{nickname}' ({common_name}), instance_id={instance_id}."
+    common_name = created.species.get("common_name", species_id)
+    return f"Plant added: '{nickname}' ({common_name}), instance_id={created.instance_id}."
 
 
 def run_chat(garden_id: str, message: str) -> str:

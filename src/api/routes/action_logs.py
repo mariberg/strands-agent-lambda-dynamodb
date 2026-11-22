@@ -4,15 +4,13 @@
   POST /api/v1/plants/{instance_id}/action-logs  — create a new log entry
 """
 
-import uuid
-from datetime import datetime, timezone
-
 from aws_lambda_powertools.event_handler.api_gateway import Router
 
 from src.api.dal import garden_data
-from src.api.enums import ActionType, LoggedBy, Severity, validate_enum
+from src.api.enums import LoggedBy
 from src.api.errors import ApiError
 from src.api.middleware import require_garden
+from src.api.services import garden_service
 
 router = Router()
 
@@ -79,49 +77,33 @@ def create_plant_action_log(instance_id: str, garden_id: str, user_id: str) -> d
     """
     from src.api.router import app  # noqa: PLC0415
 
-    plant = garden_data.get_plant(garden_id, instance_id)
-    if not plant:
-        raise ApiError(404, "not_found", f"Plant '{instance_id}' not found in this garden.")
-
     body = app.current_event.json_body or {}
 
-    raw_action_type = body.get("action_type")
-    if not raw_action_type:
-        raise ApiError(400, "missing_field", "'action_type' is required.")
-    action_type = validate_enum("action_type", raw_action_type, ActionType)
-
-    raw_severity = body.get("severity")
-    severity = validate_enum("severity", raw_severity, Severity) if raw_severity else None
-
-    raw_logged_by = body.get("logged_by")
-    logged_by = validate_enum("logged_by", raw_logged_by, LoggedBy) if raw_logged_by else None
-
-    action_id = str(uuid.uuid4())
-    occurred_at = body.get("occurred_at") or datetime.now(timezone.utc).isoformat()
-
-    item = {
-        "action_type": action_type,
-        "title": body.get("title"),
-        "notes": body.get("notes"),
-        "severity": severity,
-        "logged_by": logged_by,
-        "is_draft": body.get("is_draft", False),
-        "image_refs": [],
-        "resolved": body.get("resolved", False),
-    }
-
-    garden_data.put_log(
-        garden_id=garden_id,
-        instance_id=instance_id,
-        occurred_at=occurred_at,
-        action_id=action_id,
-        item=item,
+    # Validation, item format and the write are shared with the agent's
+    # create_action_log tool. Invalid input raises ApiError, which the router
+    # turns into a 4xx response.
+    created = garden_service.create_action_log(
+        garden_id,
+        instance_id,
+        action_type=body.get("action_type"),
+        title=body.get("title"),
+        notes=body.get("notes"),
+        severity=body.get("severity"),
+        logged_by=body.get("logged_by") or LoggedBy.user.value,
+        occurred_at=body.get("occurred_at"),
+        is_draft=body.get("is_draft", False),
+        resolved=body.get("resolved", False),
     )
 
     import json  # noqa: PLC0415
     from aws_lambda_powertools.event_handler.api_gateway import Response  # noqa: PLC0415
 
-    response_item = {**item, "action_id": action_id, "instance_id": instance_id, "occurred_at": occurred_at}
+    response_item = {
+        **created.item,
+        "action_id": created.action_id,
+        "instance_id": created.instance_id,
+        "occurred_at": created.occurred_at,
+    }
     return Response(
         status_code=201,
         content_type="application/json",
