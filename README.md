@@ -2,6 +2,8 @@
 
 Minimal demo of a gardening agent: AWS Lambda + DynamoDB single-table + Strands agents (Amazon Bedrock). The Lambda function is invoked directly through a Lambda Function URL.
 
+Read the accompanying article for more background and the reasoning behind the architecture: [The Agent Is Just Another Client: Safe Database Writes with Strands Agents on AWS](https://builder.aws.com/content/3MQv0FiPAYLc2ubiFwlnQ2xmTqT/the-agent-is-just-another-client-safe-database-writes-with-strands-agents-on-aws) on AWS Builder Center.
+
 > **Platform:** the commands in this README are for macOS and Linux (bash/zsh). On Windows, run them inside [WSL 2](https://learn.microsoft.com/windows/wsl/install).
 
 > ⚠️ **This endpoint is unauthenticated.** The Lambda Function URL has `AuthType: NONE` and is open to the public internet. Anyone with the URL can read and change the demo garden and trigger Bedrock calls. It is intended for short-lived demos only. **Delete the stack when you are done** (see [Teardown](#teardown)).
