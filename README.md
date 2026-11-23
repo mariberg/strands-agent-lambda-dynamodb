@@ -138,11 +138,6 @@ aws cloudformation deploy \
       CodeS3Key=strands-demo/function.zip
 ```
 
-Optional extra entries for the `--parameter-overrides` list:
-
-- `BedrockRegion=<region>` calls Bedrock in a different region from the default `us-east-1`.
-- `ReservedConcurrency=0` removes the function's reserved concurrency. By default the stack reserves 5 concurrent executions as a cost ceiling on the public URL. Lambda must keep 10 executions unreserved per account, so if your account's total limit is below 15 the deploy fails with `decreases account's UnreservedConcurrentExecution below its minimum value of [10]`. Check your limit with `aws lambda get-account-settings --region $AWS_REGION --query AccountLimit.ConcurrentExecutions`. If it's 10, the account limit already acts as a ceiling, so `0` is safe for this demo.
-
 Re-run this step whenever you change `infrastructure/template.yaml`.
 
 ### 5. Get the Function URL
@@ -240,17 +235,6 @@ curl -X POST "$BASE/api/v1/agent/chat" \
 curl -X DELETE "$BASE/api/v1/agent/chat"
 ```
 
-## DynamoDB key scheme
-
-```
-PK=GARDEN#<id>   SK=METADATA
-PK=GARDEN#<id>   SK=PLANT#<instance_id>
-PK=GARDEN#<id>   SK=LOG#<instance_id>#<occurred_at>#<action_id>
-PK=GARDEN#<id>   SK=DASHBOARD
-PK=GARDEN#<id>   SK=CHAT_SESSION
-PK=SPECIES#<id>  SK=METADATA
-PK=USER#<id>     SK=PROFILE
-```
 
 ## Teardown
 
