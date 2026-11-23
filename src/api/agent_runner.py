@@ -59,10 +59,13 @@ _authorized_garden_id: ContextVar[Optional[str]] = ContextVar(
 
 NO_GARDEN_CONTEXT_ERROR = "Error: No authorized garden context for this request."
 
-
-def set_authorized_garden(garden_id: str) -> None:
-    """Bind the authenticated garden to the current request context."""
-    _authorized_garden_id.set(garden_id)
+# The runners bind the garden with the token pattern:
+#     token = _authorized_garden_id.set(garden_id)
+#     try: ... run the agent ...
+#     finally: _authorized_garden_id.reset(token)
+# The reset matters on Lambda. A warm container handles the next invocation in
+# the same context, so a value that is only ever set would still be bound when
+# the next request starts.
 
 
 def _current_garden_id() -> Optional[str]:
@@ -277,9 +280,8 @@ def run_session_open(garden_id: str) -> None:
     Args:
         garden_id: The garden to assess.
     """
-    # Scope every garden tool to this garden before the agent runs.
-    set_authorized_garden(garden_id)
-
+    # Scope every garden tool to this garden for this run only.
+    token = _authorized_garden_id.set(garden_id)
     try:
         metadata = garden_data.get_garden_metadata(garden_id)
         if not metadata:
@@ -314,6 +316,9 @@ def run_session_open(garden_id: str) -> None:
 
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent session failed for garden_id=%s: %s", garden_id, exc)
+    finally:
+        # Unbind, so a warm Lambda container doesn't carry this garden into the next invocation.
+        _authorized_garden_id.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -477,10 +482,9 @@ def run_chat(garden_id: str, message: str) -> str:
         garden_id: The garden to chat about.
         message: The user's message for this turn.
     """
-    # Lock in the authorized garden before the agent runs. Every garden tool
-    # reads it from the ContextVar, so the model cannot override it.
-    set_authorized_garden(garden_id)
-
+    # Bind the authorized garden for this run only. Every garden tool reads it
+    # from the ContextVar, so the model cannot override it.
+    token = _authorized_garden_id.set(garden_id)
     try:
         metadata = garden_data.get_garden_metadata(garden_id) or {}
         city = metadata.get("city")
@@ -543,3 +547,6 @@ def run_chat(garden_id: str, message: str) -> str:
     except Exception as exc:  # noqa: BLE001
         logger.exception("Chat failed for garden_id=%s: %s", garden_id, exc)
         raise
+    finally:
+        # Unbind, so a warm Lambda container doesn't carry this garden into the next invocation.
+        _authorized_garden_id.reset(token)

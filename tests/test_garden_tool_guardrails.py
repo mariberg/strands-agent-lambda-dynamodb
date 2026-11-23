@@ -12,7 +12,8 @@ garden_id or user_id parameter, so the model has no field to put one in.
 
 Areas covered:
 1. Tool schemas      - no garden_id/user_id on any tool; params are pinned.
-2. Context binding   - the runners bind the garden and register only scoped tools.
+2. Context binding   - the runners bind the garden, unbind it afterwards (even on
+                       failure), and register only scoped tools.
 3. No context        - every tool refuses to touch the DB without a bound garden.
 4. Plant ownership   - writes to plants outside the bound garden are rejected.
 5. Scoped reads      - reads only ever query the bound garden. Weather comes from
@@ -103,7 +104,7 @@ def authorized_garden():
 
 @pytest.fixture
 def no_garden_context():
-    """Simulate a runner that forgot to call set_authorized_garden."""
+    """Simulate a fresh invocation with no garden bound."""
     token = ar._authorized_garden_id.set(None)
     yield
     ar._authorized_garden_id.reset(token)
@@ -274,6 +275,51 @@ class TestRunnersBindGarden:
         for text in (system_prompt, user_prompt):
             assert "51.5074" not in text and "-0.1278" not in text
             assert "http" not in text.lower()
+
+
+class TestRunnersReleaseGarden:
+    """
+    The runners must unbind the garden when they finish, even on failure.
+    A warm Lambda container runs the next invocation in the same context, so a
+    garden that is only ever set would leak into the next request.
+    """
+
+    def _run(self, run, agent_behaviour):
+        with patch.object(ar, "Agent") as MockAgent, \
+             patch.object(ar.garden_data, "get_garden_metadata", return_value={"city": "Test"}), \
+             patch.object(ar.garden_data, "get_chat_session", return_value=[]), \
+             patch.object(ar.garden_data, "put_chat_session"):
+            MockAgent.return_value.side_effect = agent_behaviour
+            run()
+
+    def _agent_fails(self, *_args, **_kwargs):
+        raise RuntimeError("Bedrock is down")
+
+    def test_run_chat_unbinds_after_success(self, no_garden_context):
+        self._run(lambda: ar.run_chat("demo-garden-9", "hello"), lambda *_: "ok")
+        assert ar._current_garden_id() is None
+
+    def test_run_chat_unbinds_after_failure(self, no_garden_context):
+        with pytest.raises(RuntimeError):
+            self._run(lambda: ar.run_chat("demo-garden-9", "hello"), self._agent_fails)
+        assert ar._current_garden_id() is None
+
+    def test_run_session_open_unbinds_after_success(self, no_garden_context):
+        self._run(lambda: ar.run_session_open("demo-garden-9"), lambda *_: "ok")
+        assert ar._current_garden_id() is None
+
+    def test_run_session_open_unbinds_after_failure(self, no_garden_context):
+        # run_session_open logs and swallows errors, so nothing is raised here.
+        self._run(lambda: ar.run_session_open("demo-garden-9"), self._agent_fails)
+        assert ar._current_garden_id() is None
+
+    def test_next_invocation_in_a_warm_container_starts_unbound(self, dal, no_garden_context):
+        """Invocation 1 runs a chat. Invocation 2's tool call must not see its garden."""
+        self._run(lambda: ar.run_chat("demo-garden-9", "hello"), lambda *_: "ok")
+
+        result = ar.get_garden_plants()
+        assert is_error(result)
+        dal["list_plants"].assert_not_called()
 
 
 # ---------------------------------------------------------------------------
